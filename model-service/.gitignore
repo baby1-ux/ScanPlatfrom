@@ -1,0 +1,12 @@
+# 本地虚拟环境 / 临时产物
+.venv/
+.tmp/
+.tmpprobe/
+.wheels/
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest-cache-files-*/
+
+# 本地配置（模板见 .env.example）
+.env
