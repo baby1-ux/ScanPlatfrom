@@ -1,0 +1,25 @@
+{
+  "name": "vuln-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "漏洞管理平台 — 接收 ScanMan 扫描工具上报的漏洞与正负样本，提供登录、看板、漏洞查询与处置",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"pnpm -C apps/server dev\" \"pnpm -C apps/web dev\"",
+    "dev:server": "pnpm -C apps/server dev",
+    "dev:web": "pnpm -C apps/web dev",
+    "build": "pnpm -C packages/shared build && pnpm -C apps/server build && pnpm -C apps/web build",
+    "typecheck": "pnpm -C packages/shared build && pnpm -C apps/web typecheck && pnpm -C apps/server typecheck",
+    "db:reset": "pnpm -C apps/server db:reset",
+    "db:seed": "pnpm -C apps/server db:seed",
+    "test": "pnpm -C apps/server test",
+    "smoke": "node scripts/smoke-ingest.mjs",
+    "start": "pnpm -C apps/server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}

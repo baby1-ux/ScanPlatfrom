@@ -1,0 +1,1126 @@
+openapi: 3.0.3
+info:
+  title: 漏洞管理平台 API
+  version: 1.0.0
+  description: |
+    漏洞管理平台对外接口。包含两类调用方：
+
+    - **扫描工具**（机器）：使用 `X-API-Key`，调用 `/ingest/**` 上报漏洞与正负样本。
+    - **平台前端**（浏览器）：使用 `Authorization: Bearer <JWT>`，调用查询与处置接口。
+
+    统一响应格式：`{ code, message, data, traceId }`，`code = 0` 表示业务成功。
+    时间统一为 ISO 8601 UTC，字段统一小驼峰。
+    兼容策略：只增字段，不删不改语义。
+  contact:
+    name: 平台侧
+servers:
+  - url: http://localhost:4010/api/v1
+    description: 本地 Mock（prism mock openapi.yaml）
+  - url: http://localhost:3000/api/v1
+    description: 本地开发
+  - url: https://vuln.example.com/api/v1
+    description: 生产
+
+tags:
+  - name: Auth
+    description: 登录与当前用户
+  - name: Ingest
+    description: 扫描结果上报（扫描工具专用，X-API-Key 鉴权）
+  - name: Vulnerability
+    description: 漏洞查询与处置
+  - name: Sample
+    description: 正负样本
+  - name: Stats
+    description: 统计看板
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ---------------------------------------------------------------- Auth
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: 登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: admin }
+                password: { type: string, format: password, example: "Admin@12345" }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LoginResult' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: 获取当前登录用户
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/UserInfo' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: 登出
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+
+  # -------------------------------------------------------------- Ingest
+  /ingest/ping:
+    get:
+      tags: [Ingest]
+      summary: 校验 API Key 是否有效（扫描侧自检）
+      security:
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: 校验完成（有效时 valid=true）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          valid: { type: boolean }
+                          keyName: { type: string }
+                          scopes:
+                            type: array
+                            items: { type: string }
+                          serverTime: { type: string, format: date-time }
+                          apiVersion: { type: string, example: v1 }
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+
+  /ingest/scans:
+    post:
+      tags: [Ingest]
+      summary: Step 1 创建扫描批次（幂等，scanNo 为幂等键）
+      description: 项目以 (repoType, repoUrl) 唯一匹配，不存在则自动创建。
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateScanRequest' }
+      responses:
+        '201':
+          description: 批次已创建
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CreateScanResult' }
+        '200':
+          description: 批次已存在（幂等返回，duplicated=true）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CreateScanResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /ingest/scans/{scanNo}/vulnerabilities:
+    post:
+      tags: [Ingest]
+      summary: Step 2 批量上报漏洞（1~500 条/批）
+      description: 平台按指纹去重。已存在则更新 lastFoundAt；若原状态为 fixed/ignored 则置回 open 并记为 resurfaced。
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ScanNo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vulnerabilities]
+              properties:
+                vulnerabilities:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/VulnerabilityItem' }
+      responses:
+        '200':
+          description: 上报完成（可能部分跳过）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/VulnIngestResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /ingest/scans/{scanNo}/samples:
+    post:
+      tags: [Ingest]
+      summary: Step 3 批量上报正负样本（1~500 条/批）
+      description: |
+        `label=positive` 表示该文件含漏洞（正样本），`label=negative` 表示无漏洞（负样本）。
+        正样本通过 `externalVulnId` 关联**本批次**已上报的漏洞，因此必须先调 Step 2。
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ScanNo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [samples]
+              properties:
+                samples:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/SampleItem' }
+      responses:
+        '200':
+          description: 上报完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SampleIngestResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /ingest/scans/{scanNo}/complete:
+    post:
+      tags: [Ingest]
+      summary: Step 4 结束扫描批次
+      description: 可选但强烈建议调用。未调用时平台定时任务会把超过 2 小时仍为 running 的批次标记为 partial。
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ScanNo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/ScanStatus' }
+                finishedAt: { type: string, format: date-time, nullable: true }
+                totalFiles: { type: integer, minimum: 0 }
+                scannedFiles: { type: integer, minimum: 0 }
+                errorMessage: { type: string, nullable: true, maxLength: 1000 }
+      responses:
+        '200':
+          description: 批次已结束
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CompleteScanResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /ingest/report:
+    post:
+      tags: [Ingest]
+      summary: 一次性全量上报（模式 B，小仓库/调试用）
+      description: 等价于 Step 1~4 合并，服务端在单事务内完成。vulnerabilities 与 samples 各 ≤ 500 条。
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FullReportRequest' }
+      responses:
+        '201':
+          description: 上报完成
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/FullReportResult' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ApiKeyInvalid'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  # ------------------------------------------------------- Vulnerabilities
+  /vulnerabilities:
+    get:
+      tags: [Vulnerability]
+      summary: 漏洞列表（多条件筛选 + 分页）
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: projectId
+          in: query
+          schema: { type: string, example: '1,2,3' }
+          description: 项目 ID，逗号分隔可多选
+        - name: repoType
+          in: query
+          schema: { $ref: '#/components/schemas/RepoType' }
+        - name: severity
+          in: query
+          schema: { type: string, example: 'critical,high' }
+        - name: status
+          in: query
+          schema: { type: string, example: 'open,fixing' }
+        - name: ruleId
+          in: query
+          schema: { type: string }
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: cwe
+          in: query
+          schema: { type: string }
+        - name: language
+          in: query
+          schema: { type: string }
+        - name: filePath
+          in: query
+          schema: { type: string }
+        - name: keyword
+          in: query
+          schema: { type: string }
+        - name: assignee
+          in: query
+          schema: { type: integer }
+        - name: branch
+          in: query
+          schema: { type: string }
+        - name: startTime
+          in: query
+          schema: { type: string, format: date-time }
+        - name: endTime
+          in: query
+          schema: { type: string, format: date-time }
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [lastFoundAt, firstFoundAt, severity, status, projectId]
+            default: lastFoundAt
+        - name: sortOrder
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        '200':
+          description: 成功（list 不含 codeSnippet/description）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/VulnListResult' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /vulnerabilities/{id}:
+    get:
+      tags: [Vulnerability]
+      summary: 漏洞详情（含代码片段、最新扫描上下文、操作时间线）
+      parameters:
+        - $ref: '#/components/parameters/VulnId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/VulnDetail' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vulnerabilities/{id}/status:
+    patch:
+      tags: [Vulnerability]
+      summary: 修改漏洞状态
+      parameters:
+        - $ref: '#/components/parameters/VulnId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/VulnStatus' }
+                comment: { type: string, maxLength: 512 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id: { type: integer }
+                          status: { $ref: '#/components/schemas/VulnStatus' }
+                          fixedAt: { type: string, format: date-time, nullable: true }
+                          updatedAt: { type: string, format: date-time }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /vulnerabilities/batch-status:
+    post:
+      tags: [Vulnerability]
+      summary: 批量修改漏洞状态
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, status]
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { type: integer }
+                status: { $ref: '#/components/schemas/VulnStatus' }
+                comment: { type: string, maxLength: 512 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          requested: { type: integer }
+                          updated: { type: integer }
+                          failed:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id: { type: integer }
+                                reason: { type: string }
+
+  # -------------------------------------------------------------- Samples
+  /samples:
+    get:
+      tags: [Sample]
+      summary: 样本列表（正/负样本）
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: label
+          in: query
+          schema: { $ref: '#/components/schemas/SampleLabel' }
+        - name: projectId
+          in: query
+          schema: { type: integer }
+        - name: scanNo
+          in: query
+          schema: { type: string }
+        - name: ruleId
+          in: query
+          schema: { type: string }
+        - name: language
+          in: query
+          schema: { type: string }
+        - name: keyword
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: 成功（列表只返回 snippetPreview，前 200 字符）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SampleListResult' }
+
+  # ---------------------------------------------------------------- Stats
+  /stats/overview:
+    get:
+      tags: [Stats]
+      summary: 看板总览数据
+      parameters:
+        - name: projectId
+          in: query
+          schema: { type: integer }
+        - name: days
+          in: query
+          schema: { type: integer, default: 30, minimum: 1, maximum: 365 }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/StatsOverview' }
+
+  /stats/trend:
+    get:
+      tags: [Stats]
+      summary: 漏洞趋势（按天）
+      parameters:
+        - name: days
+          in: query
+          schema: { type: integer, default: 30 }
+        - name: projectId
+          in: query
+          schema: { type: integer }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                date: { type: string, format: date }
+                                newCount: { type: integer }
+                                fixedCount: { type: integer }
+                                openCount: { type: integer }
+
+  /stats/severity:
+    get:
+      tags: [Stats]
+      summary: 漏洞等级分布
+      parameters:
+        - name: projectId
+          in: query
+          schema: { type: integer }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          list:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                severity: { $ref: '#/components/schemas/Severity' }
+                                count: { type: integer }
+                                openCount: { type: integer }
+                                fixedCount: { type: integer }
+
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: 扫描工具使用的长期凭证，形如 `vuln_sk_xxxxxxxx`。仅授予 `ingest` 权限范围。
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 平台前端登录后获得，有效期 8 小时。
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, default: 1, minimum: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, default: 20, minimum: 1, maximum: 200 }
+    ScanNo:
+      name: scanNo
+      in: path
+      required: true
+      description: 扫描批次号。含 `/` 等特殊字符时必须 URL 编码；建议扫描侧统一用 `-` 分隔。
+      schema: { type: string, maxLength: 64 }
+    VulnId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    Ok:
+      description: 成功
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+    BadRequest:
+      description: 参数校验失败
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example:
+            code: 40001
+            message: 参数校验失败
+            data:
+              errors:
+                - field: vulnerabilities[0].severity
+                  message: 必须是 critical/high/medium/low/info 之一
+            traceId: a1b2c3d4e5f6
+    Unauthorized:
+      description: 未登录或 Token 无效
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 40100, message: 未登录或 Token 无效, data: null }
+    ApiKeyInvalid:
+      description: API Key 无效、过期或被吊销
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 40101, message: API Key 无效或已被吊销, data: null }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 40400, message: 资源不存在, data: null }
+    PayloadTooLarge:
+      description: 请求体过大，请使用分片上报接口
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 41300, message: 请求体过大，请使用分片上报接口, data: null }
+    TooManyRequests:
+      description: 请求过于频繁，按 Retry-After 头退避重试
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: 建议等待秒数
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 42900, message: 请求过于频繁, data: null }
+    ServerError:
+      description: 服务器内部错误，可指数退避重试
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponse' }
+          example: { code: 50000, message: 服务器内部错误, data: null }
+
+  schemas:
+    ApiResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          description: 0 表示业务成功，非 0 见错误码表
+        message: { type: string }
+        data: { nullable: true }
+        traceId: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+
+    Severity:
+      type: string
+      enum: [critical, high, medium, low, info]
+      description: 严重 / 高危 / 中危 / 低危 / 提示
+
+    VulnStatus:
+      type: string
+      enum: [open, confirmed, fixing, fixed, ignored, false_positive]
+
+    ScanStatus:
+      type: string
+      enum: [running, success, failed, partial]
+
+    RepoType:
+      type: string
+      enum: [github, gitlab, gitee, bitbucket, other]
+
+    TriggerType:
+      type: string
+      enum: [push, merge_request, manual, schedule, webhook]
+
+    SampleLabel:
+      type: string
+      enum: [positive, negative]
+      description: positive = 有漏洞（正样本）；negative = 无漏洞（负样本）
+
+    # ---------------- ingest 请求体 ----------------
+    ScanObject:
+      type: object
+      required: [repoType, repoUrl]
+      properties:
+        repoType: { $ref: '#/components/schemas/RepoType' }
+        repoUrl: { type: string, maxLength: 512, example: 'https://github.com/org/demo' }
+        repoFullName: { type: string, maxLength: 255, example: 'org/demo' }
+        projectName: { type: string, maxLength: 128, example: demo }
+        branch: { type: string, maxLength: 128, example: main }
+        commitId: { type: string, maxLength: 64 }
+        commitMessage: { type: string, maxLength: 512 }
+        commitAuthor: { type: string, maxLength: 64 }
+        commitTime: { type: string, format: date-time, nullable: true }
+
+    ScannerInfo:
+      type: object
+      properties:
+        name: { type: string, maxLength: 64 }
+        version: { type: string, maxLength: 32 }
+
+    VulnerabilityItem:
+      type: object
+      required: [ruleId, title, severity, filePath]
+      properties:
+        externalVulnId:
+          type: string
+          maxLength: 64
+          description: 扫描工具内的漏洞 ID，用于与样本关联及双向对账
+        ruleId:
+          type: string
+          maxLength: 128
+          description: 规则 ID，参与指纹计算，**必须跨版本稳定**
+        ruleName: { type: string, maxLength: 255 }
+        title: { type: string, maxLength: 512 }
+        severity: { $ref: '#/components/schemas/Severity' }
+        category: { type: string, maxLength: 64, example: injection }
+        cwe: { type: string, maxLength: 32, example: CWE-89 }
+        cve: { type: string, maxLength: 64, nullable: true }
+        language: { type: string, maxLength: 32, example: java }
+        filePath:
+          type: string
+          maxLength: 512
+          description: 仓库相对路径，统一 `/` 分隔，不带前导 `/`
+        lineStart: { type: integer, nullable: true, minimum: 1 }
+        lineEnd: { type: integer, nullable: true, minimum: 1 }
+        codeSnippet: { type: string, nullable: true, maxLength: 65536 }
+        description: { type: string, nullable: true }
+        suggestion: { type: string, nullable: true }
+        confidence: { type: number, format: float, minimum: 0, maximum: 1, nullable: true }
+
+    SampleItem:
+      type: object
+      required: [label, filePath]
+      properties:
+        externalSampleId: { type: string, maxLength: 64 }
+        label: { $ref: '#/components/schemas/SampleLabel' }
+        filePath: { type: string, maxLength: 512 }
+        language: { type: string, maxLength: 32 }
+        lineStart: { type: integer, nullable: true }
+        lineEnd: { type: integer, nullable: true }
+        snippet: { type: string, nullable: true, maxLength: 65536 }
+        snippetHash:
+          type: string
+          maxLength: 64
+          description: 片段 sha256（64 位小写十六进制）。不传由平台计算；建议扫描侧提供以加速去重。
+        fileHash: { type: string, maxLength: 64, nullable: true }
+        externalVulnId:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: 仅正样本使用，关联本批次已上报的 VulnerabilityItem.externalVulnId
+
+    CreateScanRequest:
+      type: object
+      required: [scanNo, scan]
+      properties:
+        scanNo:
+          type: string
+          maxLength: 64
+          description: 批次号，全局唯一，幂等键。建议 {repoType}-{repoFullName}-{yyyymmdd}-{commitId前7位}，用 `-` 而非 `/`
+        scanner: { $ref: '#/components/schemas/ScannerInfo' }
+        triggerType: { $ref: '#/components/schemas/TriggerType' }
+        scan: { $ref: '#/components/schemas/ScanObject' }
+        startedAt: { type: string, format: date-time, nullable: true }
+        totalFiles: { type: integer, minimum: 0 }
+
+    FullReportRequest:
+      allOf:
+        - $ref: '#/components/schemas/CreateScanRequest'
+        - type: object
+          properties:
+            finishedAt: { type: string, format: date-time, nullable: true }
+            status: { $ref: '#/components/schemas/ScanStatus' }
+            scannedFiles: { type: integer, minimum: 0 }
+            vulnerabilities:
+              type: array
+              maxItems: 500
+              items: { $ref: '#/components/schemas/VulnerabilityItem' }
+            samples:
+              type: array
+              maxItems: 500
+              items: { $ref: '#/components/schemas/SampleItem' }
+
+    # ---------------- ingest 响应体 ----------------
+    CreateScanResult:
+      type: object
+      properties:
+        scanId: { type: integer }
+        scanNo: { type: string }
+        projectId: { type: integer }
+        projectCreated: { type: boolean }
+        status: { $ref: '#/components/schemas/ScanStatus' }
+        duplicated:
+          type: boolean
+          description: true 表示该 scanNo 已存在，本次为幂等返回
+        createdAt: { type: string, format: date-time }
+
+    VulnIngestResult:
+      type: object
+      properties:
+        received: { type: integer }
+        created: { type: integer }
+        updated: { type: integer }
+        skipped: { type: integer }
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              externalVulnId: { type: string, nullable: true }
+              vulnId: { type: integer }
+              vulnNo: { type: string }
+              fingerprint: { type: string }
+              result:
+                type: string
+                enum: [created, updated, resurfaced, skipped]
+        skippedItems:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              externalVulnId: { type: string, nullable: true }
+              reason: { type: string }
+
+    SampleIngestResult:
+      type: object
+      properties:
+        received: { type: integer }
+        created: { type: integer }
+        duplicated: { type: integer }
+        truncated: { type: integer, description: 因超过 64KB 被截断的条数 }
+        positiveCount: { type: integer }
+        negativeCount: { type: integer }
+
+    CompleteScanResult:
+      type: object
+      properties:
+        scanId: { type: integer }
+        scanNo: { type: string }
+        status: { $ref: '#/components/schemas/ScanStatus' }
+        vulnCount: { type: integer }
+        sampleCount: { type: integer }
+        positiveCount: { type: integer }
+        negativeCount: { type: integer }
+        durationMs: { type: integer }
+
+    FullReportResult:
+      type: object
+      properties:
+        scanId: { type: integer }
+        scanNo: { type: string }
+        projectId: { type: integer }
+        projectCreated: { type: boolean }
+        duplicated: { type: boolean }
+        result:
+          type: object
+          properties:
+            vulnReceived: { type: integer }
+            vulnCreated: { type: integer }
+            vulnUpdated: { type: integer }
+            vulnSkipped: { type: integer }
+            sampleReceived: { type: integer }
+            sampleCreated: { type: integer }
+            sampleDuplicated: { type: integer }
+            positiveCount: { type: integer }
+            negativeCount: { type: integer }
+
+    # ---------------- 查询响应体 ----------------
+    UserInfo:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        displayName: { type: string }
+        email: { type: string, nullable: true }
+        role: { type: string, enum: [admin, auditor, viewer] }
+        permissions:
+          type: array
+          items: { type: string }
+
+    LoginResult:
+      type: object
+      properties:
+        accessToken: { type: string }
+        tokenType: { type: string, example: Bearer }
+        expiresIn: { type: integer, example: 28800 }
+        user: { $ref: '#/components/schemas/UserInfo' }
+
+    ProjectBrief:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        repoType: { $ref: '#/components/schemas/RepoType' }
+        repoUrl: { type: string }
+
+    VulnListItem:
+      type: object
+      properties:
+        id: { type: integer }
+        vulnNo: { type: string, example: VUL-20250101-0001 }
+        title: { type: string }
+        severity: { $ref: '#/components/schemas/Severity' }
+        status: { $ref: '#/components/schemas/VulnStatus' }
+        category: { type: string, nullable: true }
+        cwe: { type: string, nullable: true }
+        cve: { type: string, nullable: true }
+        language: { type: string, nullable: true }
+        ruleId: { type: string }
+        ruleName: { type: string, nullable: true }
+        project: { $ref: '#/components/schemas/ProjectBrief' }
+        filePath: { type: string }
+        lineStart: { type: integer, nullable: true }
+        lineEnd: { type: integer, nullable: true }
+        assignee: { nullable: true }
+        confidence: { type: number, nullable: true }
+        firstFoundAt: { type: string, format: date-time }
+        lastFoundAt: { type: string, format: date-time }
+        occurrenceCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+
+    VulnListResult:
+      type: object
+      properties:
+        list:
+          type: array
+          items: { $ref: '#/components/schemas/VulnListItem' }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        summary:
+          type: object
+          description: 当前筛选条件下各等级数量
+          properties:
+            critical: { type: integer }
+            high: { type: integer }
+            medium: { type: integer }
+            low: { type: integer }
+            info: { type: integer }
+
+    VulnDetail:
+      allOf:
+        - $ref: '#/components/schemas/VulnListItem'
+        - type: object
+          properties:
+            fingerprint: { type: string }
+            description: { type: string, nullable: true }
+            suggestion: { type: string, nullable: true }
+            remark: { type: string, nullable: true }
+            location:
+              type: object
+              properties:
+                filePath: { type: string }
+                lineStart: { type: integer, nullable: true }
+                lineEnd: { type: integer, nullable: true }
+                codeSnippet: { type: string, nullable: true }
+                codeSnippetOffset: { type: integer, description: codeSnippet 首行在文件中的行号 }
+            latestScan:
+              type: object
+              properties:
+                scanId: { type: integer }
+                scanNo: { type: string }
+                branch: { type: string, nullable: true }
+                commitId: { type: string, nullable: true }
+                commitAuthor: { type: string, nullable: true }
+                commitTime: { type: string, format: date-time, nullable: true }
+                status: { $ref: '#/components/schemas/ScanStatus' }
+            samples:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  label: { $ref: '#/components/schemas/SampleLabel' }
+                  filePath: { type: string }
+                  snippet: { type: string, nullable: true }
+            fixedAt: { type: string, format: date-time, nullable: true }
+            events:
+              type: array
+              items: { $ref: '#/components/schemas/VulnEvent' }
+
+    VulnEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        action:
+          type: string
+          enum: [created, status_changed, assigned, commented, resurfaced]
+        fromValue: { type: string, nullable: true }
+        toValue: { type: string, nullable: true }
+        operatorName: { type: string, nullable: true }
+        comment: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    SampleListItem:
+      type: object
+      properties:
+        id: { type: integer }
+        label: { $ref: '#/components/schemas/SampleLabel' }
+        projectId: { type: integer }
+        scanNo: { type: string }
+        filePath: { type: string }
+        language: { type: string, nullable: true }
+        lineStart: { type: integer, nullable: true }
+        lineEnd: { type: integer, nullable: true }
+        snippetPreview:
+          type: string
+          description: 片段前 200 字符；完整内容请调 GET /samples/{id}
+        snippetSize: { type: integer }
+        vulnId: { type: integer, nullable: true }
+        ruleId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    SampleListResult:
+      type: object
+      properties:
+        list:
+          type: array
+          items: { $ref: '#/components/schemas/SampleListItem' }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        summary:
+          type: object
+          properties:
+            positive: { type: integer }
+            negative: { type: integer }
+
+    StatsOverview:
+      type: object
+      properties:
+        vulnTotal: { type: integer, description: 漏洞总数（不含误报与已忽略） }
+        vulnOpen: { type: integer, description: open + confirmed + fixing }
+        vulnCritical: { type: integer }
+        vulnHigh: { type: integer }
+        newInPeriod: { type: integer }
+        fixedInPeriod: { type: integer }
+        projectCount: { type: integer }
+        scanCount: { type: integer }
+        sampleCount: { type: integer }
+        avgFixHours: { type: number, description: 平均修复时长（小时） }
