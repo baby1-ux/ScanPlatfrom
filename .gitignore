@@ -1,0 +1,20 @@
+node_modules/
+dist/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+*.log
+.env.local
+.env.*.local
+__pycache__/
+*.pyc
+.venv/
+outputs/
+runs/
+.DS_Store
+
+# model-service 本地辅助产物
+model-service/.tmp/
+model-service/.wheels/
+model-service/.tools/
