@@ -36,6 +36,7 @@
 
 配套的 **ScanMan 模型推理服务**（`model-service/`）独立运行：前端「模型检测」页通过平台后端代理调用它，
 可对单段代码做漏洞判定与 CWE 分类，并一键归档为扫描批次与样本。
+训练好的权重就在仓库的 `model/` 下，检测与分类各一套，开箱即用。
 
 ---
 
@@ -71,30 +72,54 @@ pnpm dev
 
 ### 2.3 启动模型服务（可选，推荐）
 
+**权重已随仓库提供**，位于 `model/` 下，两个任务各约 475 MB：
+
+| 任务 | 权重目录 | 输出 |
+|---|---|---|
+| 检测（二分类） | `model/cvefixes_detection_codebert-base/best` | `safe` / `vulnerable` + 概率 |
+| 分类（41 类） | `model/codebert_cvefixes_cls/best` | 40 个 CWE + `OTHER` 的 Top-K |
+
+**第一步：告诉模型服务权重在哪。** 从模板复制出 `model-service/.env` 并填绝对路径
+（`.env` 在本地 `.gitignore` 中，本机已有一份配好的，新环境按下面填即可）：
+
+```ini
+DETECTION_CHECKPOINT=<仓库绝对路径>\model\cvefixes_detection_codebert-base\best
+CLASSIFICATION_CHECKPOINT=<仓库绝对路径>\model\codebert_cvefixes_cls\best
+```
+
+**第二步：启动。**
+
 ```bash
 cd model-service
-./run.ps1            # Windows；Linux/macOS 用 ./run.sh
+./run.ps1 -SkipInstall     # Windows：依赖已装好时用，秒起
+./run.ps1                  # Windows：首次启动（建 .venv + 装依赖）
+SKIP_INSTALL=1 ./run.sh    # Linux / macOS
 ```
+
+日志出现「**服务已启动，模型就绪**」并打印两个 checkpoint 即成功；
+若出现「降级模式」，说明权重没找到，按日志里的路径提示排查（见下方 ⚠️）。
+
+**第三步：验证。**
+
+```bash
+curl http://127.0.0.1:8000/health
+# → modelServed: true、degraded: false、modelName: codebert-base，两个 checkpoint 都有值
+
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" \
+  -d '{"code":"void f(char *s){ char buf[10]; strcpy(buf, s); }","mode":"auto"}'
+# → verdict: vulnerable（0.764）、predictedCwe: CWE-787、topCwe 给出 Top-5
+```
+
+> Windows 上建议用 `curl.exe`；引号麻烦时可把 body 存成文件再 `curl -d @body.json`。
 
 模型服务起来后，前端顶部标签会从「模型服务 离线」变为「在线」，
 「模型检测」页的结果即来自真实的 ScanMan 模型；离线时会明确标记为**降级启发式判定**。
 详见 [`model-service/README.md`](model-service/README.md)。
 
-> **重要：权重通常不在本仓库内。** 已训练好的 ScanMan 检测权重在本机位于
-> `D:\ai_demo\demo\demo1_git\ScanMan\outputs\cvefixes_detection_codebert-base\best`（475 MB）。
-> 启动前把训练工程根目录告诉模型服务即可，**不需要拷贝权重**：
->
-> ```powershell
-> $env:SCANMAN_ROOT = 'D:\ai_demo\demo\demo1_git\ScanMan'
-> ./run.ps1
-> ```
->
-> 或直接指定 `DETECTION_CHECKPOINT='...\cvefixes_detection_codebert-base\best'`。
->
-> **分类任务例外**：该工程下所有 `*_classification_*` / `merged_top27_*` 的 `best/`
-> 里**只有 `label_map.json`、没有权重文件**，因此 CWE 分类只能走降级；
-> 这时 `/health` 会显示 `detection.available: true` 而整体 `degraded: true` ——
-> 这是正确行为，页面上也会提示。
+> ⚠️ **`.env` 必须保存为 UTF-8。** `run.ps1` 按 UTF-8 读取，若用记事本另存成 ANSI/GBK，
+> 路径里的中文（如 `漏洞管理平台`）会被读成乱码，表现为
+> 「环境变量指定的 detection checkpoint 不存在」而**误进降级模式**。
+> 排查方法：看启动时打印的路径，中文是否变成了 `婕忔礊绠＄悊骞冲彴` 这样的乱码。
 
 ### 2.4 验证链路
 
@@ -150,6 +175,9 @@ pnpm smoke
 │           └── pages/              # login | dashboard | vulnerability | project
 │                                   # scan | sample | model | setting
 ├── packages/shared/                # 前后端共享类型与枚举（单一事实来源）
+├── model/                          # 已训练好的 ScanMan 权重（约 950 MB，随仓库提供）
+│   ├── cvefixes_detection_codebert-base/best   # 任务 A 检测：safe / vulnerable
+│   └── codebert_cvefixes_cls/best              # 任务 B 分类：40 个 CWE + OTHER
 ├── model-service/                  # ScanMan 模型推理服务（FastAPI）
 ├── scripts/smoke-ingest.mjs        # 端到端冒烟测试
 ├── apps/server/tests/              # 集成测试（node:test，59 个用例）
@@ -232,11 +260,23 @@ pnpm smoke
 - 模型服务不可用时按 `ML_FALLBACK` 处理：`fallback` 走启发式降级
   （响应 `degraded: true`，并在写入的漏洞描述里注明），`strict` 直接返回 503。
 - 降级结果**绝不会**被伪装成模型输出。
-- **逐任务来源**：模型服务于 `/predict` 返回 `tasks.detection` / `tasks.classification`，
-  分别标明该任务是否由真实模型完成。原因是 `mode=auto` 下只要一个任务降级，
-  整体就是 `degraded: true`；本机正好只有检测权重，于是「检测是真模型、分类是 mock」。
+- **逐任务来源**：模型服务的 `/predict` 会返回 `tasks.detection` / `tasks.classification`，
+  分别标明该任务是否由真实模型完成。原因是 `mode=auto` 下只要**任意一个**任务降级，
+  顶层的 `degraded` 就是 `true`；只有拆开看才能判断到底哪部分是 mock。
+  本机两个权重都配齐，`tasks.detection` 与 `tasks.classification` 都是 `modelServed: true`。
   前端据此对真模型的部分正常展示，只对降级的部分打「启发式 mock」标签 ——
   否则会把真模型判定的漏洞误当成 mock 丢掉。
+
+**两个权重的训练指标**（取自各自的 `results.json`；数据集 CVEfixes，基座 `codebert-base`，3 epoch）：
+
+| 任务 | 目录 | test 指标 |
+|---|---|---|
+| 检测 | `cvefixes_detection_codebert-base` | accuracy **0.762** / precision 0.705 / recall 0.805 / F1 **0.752** / MCC 0.529 / ROC-AUC 0.840 |
+| 分类 | `codebert_cvefixes_cls` | accuracy 0.252 / macro-F1 0.173 / **Top-3 accuracy 0.455** |
+
+> 分类是 41 类单标签，准确率天然偏低（Top-3 才 0.455），且只训了 3 个 epoch。
+> 页面展示的是 Top-5 CWE 概率，**只作为人工研判线索，不要直接当结论**。
+> 后续重训出更好的权重后，直接替换 `model/codebert_cvefixes_cls/best` 目录即可，无需改代码。
 
 ### 4.5 演示数据是用真实 ingest 服务生成的
 
@@ -272,6 +312,10 @@ pnpm -C apps/server db:reset      # 清库 + 重新灌演示数据
 pnpm -C apps/server db:seed       # 仅灌演示数据（表为空时才写）
 pnpm smoke                        # 端到端冒烟测试（需后端已启动）
 pnpm -C apps/server build && pnpm -C apps/server start   # 生产模式启动后端
+
+cd model-service && ./run.ps1 -SkipInstall   # 起模型服务 :8000（依赖已装好）
+cd model-service && ./run.ps1                # 首次：建 venv + 装依赖 + 启动
+curl http://127.0.0.1:8000/health            # 模型服务自检（degraded 应为 false）
 ```
 
 放大演示数据规模（便于压测列表分页与看板）：
@@ -333,6 +377,7 @@ curl -X POST $API/ingest/scans/$SCAN/complete \
 - [ ] 吊销演示用 API Key `vuln_sk_demo...`，为每个 CI 环境单独创建
 - [ ] 按需切换 MySQL：实现 `Db` 接口的 MySQL 适配器并设 `DB_CLIENT=mysql`
 - [ ] 用 Nginx 托管 `apps/web/dist` 静态资源并反代 `/api`
+- [ ] 部署 `model/` 权重与 `model-service/.env`，确认 `GET :8000/health` 的 `degraded` 为 `false`
 - [ ] 确认 `CORS_ORIGIN` 只包含正式域名
 - [ ] 配置数据库每日备份（保留 30 天）与日志采集
 
@@ -346,3 +391,9 @@ curl -X POST $API/ingest/scans/$SCAN/complete \
    当前只在演示数据里造了这种状态，定时任务待补（P1）。
 4. **Webhook / 告警 / 审计日志**为 P2，未实现（`audit_logs` 表已建好）。
 5. **样本分月归档未实现**：样本表历史数据量增长后需补归档策略（P1）。
+6. **分类模型精度偏低**：41 类 CWE 单标签 accuracy 仅 0.252、Top-3 0.455（只训了 3 个 epoch）。
+   检测模型（F1 0.752）可用于初筛，分类结果建议只作人工研判线索。
+   重训后替换 `model/codebert_cvefixes_cls/best` 即可，无需改代码。
+7. **模型权重约 950 MB 且当前未被 `.gitignore` 排除**：若要精简仓库体积，
+   可把 `model/` 移出仓库并改用 `DETECTION_CHECKPOINT` / `CLASSIFICATION_CHECKPOINT`
+   指向外部路径。
