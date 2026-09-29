@@ -1,20 +1,119 @@
+# ============================================================
+# 漏洞管理平台 .gitignore
+# 原则：源码 / 配置模板 / 文档 要上传；依赖、构建产物、
+#       本地数据、密钥、大文件 一律不上传。
+# ============================================================
+
+# ---------------- 依赖与包管理器缓存（体积最大，绝对不要传）----------------
 node_modules/
+**/node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+pnpm-error.log*
+.npm/
+.npmrc
+.yarn/
+yarn-error.log*
+package-lock.json.bak
+
+# ---------------- 构建产物（可由源码重新生成）----------------
 dist/
-data/*.db
-data/*.db-journal
-data/*.db-wal
-data/*.db-shm
+**/dist/
+build/
+**/build/
+out/
+*.tsbuildinfo
+.vite/
+.turbo/
+.parcel-cache/
+
+# ---------------- 缓存与测试覆盖率 ----------------
+.cache/
+coverage/
+.nyc_output/
+.eslintcache
+.stylelintcache
 *.log
-.env.local
-.env.*.local
+logs/
+
+# ---------------- Python（model-service 相关）----------------
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
 .venv/
-outputs/
-runs/
-.DS_Store
+venv/
+env/
+.python-version
 
 # model-service 本地辅助产物
 model-service/.tmp/
+model-service/.tmpprobe/
 model-service/.wheels/
 model-service/.tools/
+
+# ---------------- 环境变量与密钥（.env.example 必须保留上传）----------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets.json
+credentials.json
+
+# ---------------- 本地数据库与运行数据 ----------------
+data/*
+!data/.gitkeep
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ---------------- 模型权重 / 大数据文件（建议走 Release 或 Git LFS）----------------
+model/*
+!model/.gitkeep
+*.pkl
+*.joblib
+*.pickle
+*.h5
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.parquet
+*.csv.gz
+*.tar.gz
+*.zip
+
+# ---------------- IDE / 编辑器（个人环境配置，不属于项目）----------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------- 汇报 / 演示类大文件（二进制，不适合放代码仓库）----------------
+*.ppt
+*.pptx
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.pdf
